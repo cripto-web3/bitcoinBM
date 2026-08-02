@@ -7,7 +7,6 @@
 #define BITCOIN_WALLET_WALLET_H
 
 #include <addresstype.h>
-#include <btcsignals.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
@@ -23,6 +22,8 @@
 #include <sync.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/btcsignals.h>
+#include <util/expected.h>
 #include <util/fs.h>
 #include <util/hasher.h>
 #include <util/log.h>
@@ -690,10 +691,19 @@ public:
      * broadcasting the transaction.
      *
      * @param[in] tx The transaction to be broadcast.
-     * @param[in] mapValue key-values to be set on the transaction.
-     * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
+     * @param[in] replaces_txid The txid of the transaction that this transaction replaces
+     * @param[in] comment The user's comment for this transaction
+     * @param[in] comment_to The comment for this transaction indicating where coins are sent to
+     * @param[in] messages The BIP 21 URI messages to attach to this transaction
      */
-    void CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm);
+    void CommitTransaction(
+        CTransactionRef tx,
+        std::optional<Txid> replaces_txid = std::nullopt,
+        std::optional<std::string> comment = std::nullopt,
+        std::optional<std::string> comment_to = std::nullopt,
+        const std::vector<std::string>& messages = {},
+        const std::vector<std::string>& payment_requests = {}
+    );
 
     /** Pass this transaction to node for optional mempool insertion and relay to peers. */
     bool SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, node::TxBroadcast broadcast_method) const
@@ -881,7 +891,7 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    [[nodiscard]] bool BackupWallet(const std::string& strDest) const;
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;
@@ -1103,6 +1113,10 @@ public:
         if (m_wallet.fScanningWallet.exchange(true)) {
             return false;
         }
+        // Discard any abort request left over from previous reservation, so
+        // that an abort requested while the reservation is held always applies
+        // to abort this rescan, even if it arrives before the scan loop starts.
+        m_wallet.fAbortRescan = false;
         m_wallet.m_scanning_with_passphrase.exchange(with_passphrase);
         m_wallet.m_scanning_start = SteadyClock::now();
         m_wallet.m_scanning_progress = 0;
@@ -1136,6 +1150,8 @@ bool RemoveWalletSetting(interfaces::Chain& chain, const std::string& wallet_nam
 
 struct MigrationResult {
     std::string wallet_name;
+    std::optional<std::string> watchonly_wallet_name;
+    std::optional<std::string> solvables_wallet_name;
     std::shared_ptr<CWallet> wallet;
     std::shared_ptr<CWallet> watchonly_wallet;
     std::shared_ptr<CWallet> solvables_wallet;
@@ -1143,9 +1159,9 @@ struct MigrationResult {
 };
 
 //! Do all steps to migrate a legacy wallet to a descriptor wallet
-[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context);
+[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context, bool load_wallet = true);
 //! Requirement: The wallet provided to this function must be isolated, with no attachment to the node's context.
-[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet> local_wallet, const SecureString& passphrase, WalletContext& context);
+[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet> local_wallet, const SecureString& passphrase, WalletContext& context, bool load_wallet = true);
 
 //! Determine the path that the wallet is stored in
 util::Result<fs::path> GetWalletPath(const std::string& name);

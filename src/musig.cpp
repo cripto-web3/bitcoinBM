@@ -11,10 +11,7 @@
 
 //! MuSig2 chaincode as defined by BIP 328
 using namespace util::hex_literals;
-constexpr uint256 MUSIG_CHAINCODE{
-    // Use immediate lambda to work around GCC-14 bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=117966
-    []() consteval { return uint256{"868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"_hex_u8}; }(),
-};
+const ChainCode MUSIG_CHAINCODE{"868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"_hex_u8};
 
 static bool GetMuSig2KeyAggCache(const std::vector<CPubKey>& pubkeys, secp256k1_musig_keyagg_cache& keyagg_cache)
 {
@@ -78,7 +75,7 @@ CExtPubKey CreateMuSig2SyntheticXpub(const CPubKey& pubkey)
 {
     CExtPubKey extpub;
     extpub.nDepth = 0;
-    std::memset(extpub.vchFingerprint, 0, 4);
+    extpub.fingerprint.fill(0);
     extpub.nChild = 0;
     extpub.chaincode = MUSIG_CHAINCODE;
     extpub.pubkey = pubkey;

@@ -93,7 +93,7 @@ FUZZ_TARGET(scriptpubkeyman, .init = initialize_spkm)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
-    NodeClockContext clock_ctx{ConsumeTime(fuzzed_data_provider)};
+    FakeNodeClock clock{ConsumeTime(fuzzed_data_provider)};
     const auto& node{g_setup->m_node};
     Chainstate& chainstate{node.chainman->ActiveChainstate()};
     std::unique_ptr<CWallet> wallet_ptr{std::make_unique<CWallet>(node.chain.get(), "", CreateMockableWalletDatabase())};
@@ -123,7 +123,7 @@ FUZZ_TARGET(scriptpubkeyman, .init = initialize_spkm)
     }
 
     bool good_data{true};
-    LIMITED_WHILE(good_data && fuzzed_data_provider.ConsumeBool(), 20) {
+    LIMITED_WHILE (good_data && fuzzed_data_provider.ConsumeBool(), 20) {
         CallOneOf(
             fuzzed_data_provider,
             [&] {
@@ -218,7 +218,7 @@ FUZZ_TARGET(spkm_migration, .init = initialize_spkm_migration)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
-    NodeClockContext clock_ctx{ConsumeTime(fuzzed_data_provider)};
+    FakeNodeClock clock{ConsumeTime(fuzzed_data_provider)};
     const auto& node{g_setup->m_node};
     Chainstate& chainstate{node.chainman->ActiveChainstate()};
 
@@ -234,7 +234,7 @@ FUZZ_TARGET(spkm_migration, .init = initialize_spkm_migration)
     auto& legacy_data{*wallet.GetOrCreateLegacyDataSPKM()};
 
     std::vector<CKey> keys;
-    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 30) {
+    LIMITED_WHILE (fuzzed_data_provider.ConsumeBool(), 30) {
         const auto key{ConsumePrivateKey(fuzzed_data_provider)};
         if (!key.IsValid()) return;
         auto pub_key{key.GetPubKey()};
@@ -257,10 +257,10 @@ FUZZ_TARGET(spkm_migration, .init = initialize_spkm_migration)
 
     bool add_inactive_hd_chain{fuzzed_data_provider.ConsumeBool() && !keys.empty()};
     if (add_inactive_hd_chain) {
-        hd_key = PickValue(fuzzed_data_provider, keys);
+        CKey inactive_hd_key = PickValue(fuzzed_data_provider, keys);
         hd_chain.nVersion = fuzzed_data_provider.ConsumeBool() ? CHDChain::VERSION_HD_CHAIN_SPLIT : CHDChain::VERSION_HD_BASE;
-        bool dup_chain = hd_chain.seed_id == hd_key.GetPubKey().GetID();
-        hd_chain.seed_id = hd_key.GetPubKey().GetID();
+        bool dup_chain = hd_key.IsValid() && std::equal(hd_key.begin(), hd_key.end(), inactive_hd_key.begin());
+        hd_chain.seed_id = inactive_hd_key.GetPubKey().GetID();
         legacy_data.AddInactiveHDChain(hd_chain);
         if (!dup_chain) added_chains++;
     }
@@ -276,7 +276,7 @@ FUZZ_TARGET(spkm_migration, .init = initialize_spkm_migration)
 
     size_t added_script{0};
     bool good_data{true};
-    LIMITED_WHILE(good_data && fuzzed_data_provider.ConsumeBool(), 30) {
+    LIMITED_WHILE (good_data && fuzzed_data_provider.ConsumeBool(), 30) {
         CallOneOf(
             fuzzed_data_provider,
             [&] {

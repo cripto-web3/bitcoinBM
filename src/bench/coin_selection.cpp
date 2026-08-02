@@ -4,8 +4,6 @@
 
 #include <bench/bench.h>
 #include <consensus/amount.h>
-#include <interfaces/chain.h>
-#include <node/context.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
@@ -13,19 +11,21 @@
 #include <random.h>
 #include <sync.h>
 #include <test/util/setup_common.h>
+#include <util/check.h>
 #include <util/result.h>
 #include <wallet/coinselection.h>
-#include <wallet/context.h>
+#include <wallet/db.h>
 #include <wallet/spend.h>
-#include <wallet/test/util.h>
+#include <wallet/sqlite.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
-#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -50,7 +50,7 @@ static void addCoin(const CAmount& nValue, std::vector<std::unique_ptr<CWalletTx
 static void CoinSelection(benchmark::Bench& bench)
 {
     const auto test_setup = MakeNoLogFileContext<TestingSetup>();
-    CWallet wallet(test_setup->m_node.chain.get(), "", CreateMockableWalletDatabase());
+    CWallet wallet(test_setup->m_node.chain.get(), "", MakeInMemoryWalletDatabase());
     std::vector<std::unique_ptr<CWalletTx>> wtxs;
     LOCK(wallet.cs_wallet);
 

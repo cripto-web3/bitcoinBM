@@ -79,6 +79,7 @@ add_executable(fuzz
   overflow.cpp
   p2p_handshake.cpp
   p2p_headers_presync.cpp
+  p2p_private_broadcast.cpp
   p2p_transport_serialization.cpp
   pcp.cpp
   package_eval.cpp
@@ -94,6 +95,7 @@ add_executable(fuzz
   pow.cpp
   prevector.cpp
   primitives_transaction.cpp
+  private_broadcast.cpp
   process_message.cpp
   process_messages.cpp
   protocol.cpp
@@ -140,6 +142,10 @@ add_executable(fuzz
   versionbits.cpp
 )
 
+if(ENABLE_IPC)
+  add_subdirectory(${PROJECT_SOURCE_DIR}/src/ipc/test/fuzz ipc)
+endif()
+
 add_windows_application_manifest(fuzz)
 
 target_link_libraries(fuzz
@@ -154,7 +160,6 @@ target_link_libraries(fuzz
   univalue
   secp256k1
   Boost::headers
-  libevent::extra
 )
 
 if(ENABLE_WALLET)

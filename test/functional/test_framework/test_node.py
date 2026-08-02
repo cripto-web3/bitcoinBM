@@ -18,7 +18,6 @@ import tempfile
 import time
 import urllib.parse
 import collections
-import shlex
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -109,18 +108,12 @@ class TestNode():
         extra_conf=None,
         extra_args=None,
         use_cli=False,
-        start_perf=False,
         version=None,
         v2transport=False,
         uses_wallet=False,
         ipcbind=False,
+        use_gui=False,
     ):
-        """
-        Kwargs:
-            start_perf (bool): If True, begin profiling the node with `perf` as soon as
-                the node starts.
-        """
-
         self.index = i
         self.datadir_path = datadir_path
         self.bitcoinconf = self.datadir_path / "bitcoin.conf"
@@ -133,6 +126,7 @@ class TestNode():
         self.binaries = binaries
         self.coverage_dir = coverage_dir
         self.cwd = cwd
+        self.use_gui = use_gui
         self.has_explicit_bind = False
         if extra_conf is not None:
             append_config(self.datadir_path, extra_conf)
@@ -146,11 +140,10 @@ class TestNode():
         # Configuration for logging is set as command-line args rather than in the bitcoin.conf file.
         # This means that starting a bitcoind using the temp dir to debug a failed test won't
         # spam debug.log.
-        self.args = self.binaries.node_argv(need_ipc=ipcbind) + [
+        self.args = self.binaries.node_argv(need_ipc=ipcbind, use_gui=use_gui) + [
             f"-datadir={self.datadir_path}",
             "-logtimemicros",
             "-debug",
-            "-debugexclude=libevent",
             "-debugexclude=leveldb",
             "-debugexclude=rand",
             "-uacomment=testnode%d" % i,  # required for subversion uniqueness across peers
@@ -191,7 +184,6 @@ class TestNode():
 
         self.cli = None
         self.use_cli = use_cli
-        self.start_perf = start_perf
 
         self.running = False
         self.process = None
@@ -200,8 +192,6 @@ class TestNode():
         self.reuse_http_connections = True # Must be set before create_new_rpc_connection(), i.e. before restarting node
         self.url = None
         self.log = logging.getLogger('TestFramework.node%d' % i)
-        # Cache perf subprocesses here by their data output filename.
-        self.perf_subprocesses = {}
 
         self.p2ps = []
 
@@ -290,6 +280,25 @@ class TestNode():
 
         # add environment variable LIBC_FATAL_STDERR_=1 so that libc errors are written to stderr and not the terminal
         subp_env = dict(os.environ, LIBC_FATAL_STDERR_="1")
+        if self.use_gui:
+            subp_env.setdefault("QT_QPA_PLATFORM", "minimal")
+            if platform.system() == "Darwin":
+                # QMacStyle assumes a Cocoa platform window, which the minimal platform
+                # does not provide. In particular, painting a QGroupBox can make Qt call
+                # addSubview: on an invalid native object (QTBUG-49686).
+                subp_env.setdefault("QT_STYLE_OVERRIDE", "fusion")
+            subp_env.setdefault("LC_ALL", "nl_NL.UTF-8") # Set language to try to trigger translation bugs
+            if sys.platform.startswith("linux") and "XDG_RUNTIME_DIR" not in subp_env:
+                # Qt prints warnings to stderr when XDG_RUNTIME_DIR is unset or has wrong
+                # permissions (e.g. in CI environments without a desktop session), which
+                # would cause tests to fail due to unexpected stderr output. The two
+                # warnings are:
+                #   "QStandardPaths: XDG_RUNTIME_DIR not set, defaulting to '/tmp/runtime-root'"
+                #   "QStandardPaths: wrong permissions on runtime directory /path, 0755 instead of 0700"
+                # Use a dedicated subdirectory with the required 0700 permissions.
+                xdg_runtime_dir = self.datadir_path / "xdg_runtime"
+                xdg_runtime_dir.mkdir(mode=0o700, exist_ok=True)
+                subp_env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
         if env is not None:
             subp_env.update(env)
 
@@ -297,9 +306,6 @@ class TestNode():
 
         self.running = True
         self.log.debug("bitcoind started, waiting for RPC to come up")
-
-        if self.start_perf:
-            self._start_perf()
 
     def create_new_rpc_connection(self, *, mode="AUTO", client_timeout=None):
         """Create an additional RPC connection, likely to be used in a new thread."""
@@ -490,10 +496,6 @@ class TestNode():
         else:
             self.stop()
 
-        # If there are any running perf processes, stop them.
-        for profile_name in tuple(self.perf_subprocesses.keys()):
-            self._stop_perf(profile_name)
-
         del self.p2ps[:]
 
         assert (not expected_stderr) or wait_until_stopped  # Must wait to check stderr
@@ -678,84 +680,6 @@ class TestNode():
         initial_peer_id = get_highest_peer_id()
         yield
         self.wait_until(lambda: get_highest_peer_id() > initial_peer_id, timeout=timeout)
-
-    @contextlib.contextmanager
-    def profile_with_perf(self, profile_name: str):
-        """
-        Context manager that allows easy profiling of node activity using `perf`.
-
-        See `test/functional/README.md` for details on perf usage.
-
-        Args:
-            profile_name: This string will be appended to the
-                profile data filename generated by perf.
-        """
-        subp = self._start_perf(profile_name)
-
-        yield
-
-        if subp:
-            self._stop_perf(profile_name)
-
-    def _start_perf(self, profile_name=None):
-        """Start a perf process to profile this node.
-
-        Returns the subprocess running perf."""
-        subp = None
-
-        def test_success(cmd):
-            return subprocess.call(
-                # shell=True required for pipe use below
-                cmd, shell=True,
-                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL) == 0
-
-        if platform.system() != 'Linux':
-            self.log.warning("Can't profile with perf; only available on Linux platforms")
-            return None
-
-        if not test_success('which perf'):
-            self.log.warning("Can't profile with perf; must install perf-tools")
-            return None
-
-        if not test_success('readelf -S {} | grep .debug_str'.format(shlex.quote(self.binary))):
-            self.log.warning(
-                "perf output won't be very useful without debug symbols compiled into bitcoind")
-
-        output_path = tempfile.NamedTemporaryFile(
-            dir=self.datadir_path,
-            prefix="{}.perf.data.".format(profile_name or 'test'),
-            delete=False,
-        ).name
-
-        cmd = [
-            'perf', 'record',
-            '-g',                     # Record the callgraph.
-            '--call-graph', 'dwarf',  # Compatibility for gcc's --fomit-frame-pointer.
-            '-F', '101',              # Sampling frequency in Hz.
-            '-p', str(self.process.pid),
-            '-o', output_path,
-        ]
-        subp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.perf_subprocesses[profile_name] = subp
-
-        return subp
-
-    def _stop_perf(self, profile_name):
-        """Stop (and pop) a perf subprocess."""
-        subp = self.perf_subprocesses.pop(profile_name)
-        output_path = subp.args[subp.args.index('-o') + 1]
-
-        subp.terminate()
-        subp.wait(timeout=10)
-
-        stderr = subp.stderr.read().decode()
-        if 'Consider tweaking /proc/sys/kernel/perf_event_paranoid' in stderr:
-            self.log.warning(
-                "perf couldn't collect data! Try "
-                "'sudo sysctl -w kernel.perf_event_paranoid=-1'")
-        else:
-            report_cmd = "perf report -i {}".format(output_path)
-            self.log.info("See perf output by running '{}'".format(report_cmd))
 
     def assert_start_raises_init_error(self, extra_args=None, expected_msg=None, match=ErrorMatch.FULL_TEXT, *args, **kwargs):
         """Attempt to start the node and expect it to raise an error.

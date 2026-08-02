@@ -165,7 +165,6 @@ BasicTestingSetup::BasicTestingSetup(const ChainType chainType, TestOpts opts)
             "-logthreadnames",
             "-loglevel=trace",
             "-debug",
-            "-debugexclude=libevent",
             "-debugexclude=leveldb",
         },
         opts.extra_args);
@@ -308,8 +307,10 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
             .check_block_index = 1,
             .notifications = *m_node.notifications,
             .signals = m_node.validation_signals.get(),
-            // Use no worker threads while fuzzing to avoid non-determinism
+            // Use no worker threads while fuzzing to avoid racy non-determinism
+            // and dangling thread handles if AFL forks after initialization.
             .worker_threads_num = EnableFuzzDeterminism() ? 0 : 2,
+            .prevoutfetch_threads_num = EnableFuzzDeterminism() ? 0 : 2,
         };
         if (opts.min_validation_cache) {
             chainman_opts.script_execution_cache_bytes = 0;
@@ -416,7 +417,6 @@ TestChain100Setup::TestChain100Setup(
     TestOpts opts)
     : TestingSetup{ChainType::REGTEST, opts}
 {
-    SetMockTime(1598887952);
     constexpr std::array<unsigned char, 32> vchKey = {
         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
     coinbaseKey.Set(vchKey.begin(), vchKey.end(), true);
@@ -438,7 +438,7 @@ void TestChain100Setup::mineBlocks(int num_blocks)
     for (int i = 0; i < num_blocks; i++) {
         std::vector<CMutableTransaction> noTxns;
         CBlock b = CreateAndProcessBlock(noTxns, scriptPubKey);
-        SetMockTime(GetTime() + 1);
+        m_clock += 1s;
         m_coinbase_txns.push_back(b.vtx[0]);
     }
 }
@@ -638,6 +638,29 @@ std::vector<CTransactionRef> TestChain100Setup::PopulateMempool(FastRandomContex
         undo_info.clear();
     }
     return mempool_transactions;
+}
+
+SocketTestingSetup::SocketTestingSetup()
+{
+    // HTTPServer is not integrated into NodeContext yet and still pulls global args.
+    // This is the IP address DynSock claims to be from when connecting.
+    gArgs.ForceSetArg("-rpcallowip", "5.5.5.5");
+
+    // "back up" the current CreateSock() so we can restore it after the test
+    m_create_sock_orig = CreateSock;
+
+    CreateSock = [this](int, int, int) {
+        // This is a mock Listening Socket that a server can "bind" to and
+        // listen to for incoming connections. We won't need to access its I/O
+        // pipes because we don't read or write directly to it. It will return
+        // Connected Sockets from the queue via its Accept() method.
+        return std::make_unique<DynSock>(std::make_shared<DynSock::Pipes>(), &m_accepted_sockets);
+    };
+};
+
+SocketTestingSetup::~SocketTestingSetup()
+{
+    CreateSock = m_create_sock_orig;
 }
 
 /**

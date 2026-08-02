@@ -7,13 +7,10 @@
 
 #include <init.h>
 
-#include <kernel/checks.h>
-
 #include <addrdb.h>
 #include <addrman.h>
 #include <banman.h>
 #include <blockfilter.h>
-#include <btcsignals.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
@@ -42,6 +39,7 @@
 #include <kernel/blockmanager_opts.h>
 #include <kernel/caches.h>
 #include <kernel/chainstatemanager_opts.h>
+#include <kernel/checks.h>
 #include <kernel/context.h>
 #include <kernel/notifications_interface.h>
 #include <key.h>
@@ -87,6 +85,7 @@
 #include <uint256.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
+#include <util/btcsignals.h>
 #include <util/chaintype.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -146,6 +145,10 @@
 using common::InvalidPortErrMsg;
 using common::ResolveErrMsg;
 
+using http_bitcoin::InitHTTPServer;
+using http_bitcoin::InterruptHTTPServer;
+using http_bitcoin::StartHTTPServer;
+using http_bitcoin::StopHTTPServer;
 using node::ApplyArgsManOptions;
 using node::BlockManager;
 using node::CalculateCacheSizes;
@@ -166,6 +169,7 @@ using node::VerifyLoadedChainstate;
 using util::Join;
 using util::ReplaceAll;
 using util::ToString;
+using util::TrimStringView;
 
 static constexpr bool DEFAULT_PROXYRANDOMIZE{true};
 static constexpr bool DEFAULT_REST_ENABLE{false};
@@ -535,6 +539,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-minimumchainwork=<hex>", strprintf("Minimum work assumed to exist on a valid chain in hex (default: %s, testnet3: %s, testnet4: %s, signet: %s)", defaultChainParams->GetConsensus().nMinimumChainWork.GetHex(), testnetChainParams->GetConsensus().nMinimumChainWork.GetHex(), testnet4ChainParams->GetConsensus().nMinimumChainWork.GetHex(), signetChainParams->GetConsensus().nMinimumChainWork.GetHex()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-par=<n>", strprintf("Set the number of script verification threads (0 = auto, up to %d, <0 = leave that many cores free, default: %d)",
         MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-prevoutfetchthreads=<n>", strprintf("Set the number of threads used to prefetch block input prevouts from the chainstate database (0 disables, up to %d, default: %d). Negative values are rejected.", MAX_PREVOUTFETCH_THREADS, DEFAULT_PREVOUTFETCH_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-persistmempool", strprintf("Whether to save the mempool on shutdown and load on restart (default: %u)", DEFAULT_PERSIST_MEMPOOL), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-persistmempoolv1",
                    strprintf("Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy format "
@@ -543,7 +548,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-pid=<file>", strprintf("Specify pid file. Relative paths will be prefixed by a net-specific datadir location. (default: %s)", BITCOIN_PID_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-prune=<n>", strprintf("Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC to be called to delete specific blocks and enables automatic pruning of old blocks if a target size in MiB is provided. This mode is incompatible with -txindex. "
-            "Warning: Reverting this setting requires re-downloading the entire blockchain. "
+            "Warning: Reverting this setting requires re-downloading the entire blockchain. Wallets and indexes should be loaded at startup and kept active while pruning is enabled so they stay synchronized before old block data is deleted; wallets or indexes that fall behind pruned data may require a reindex. "
             "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex", "If enabled, wipe chain state and block index, and rebuild them from blk*.dat files on disk. Also wipe and rebuild other optional indexes that are active. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex-chainstate", "If enabled, wipe chain state, and rebuild it from blk*.dat files on disk. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -579,7 +584,12 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listenonion", strprintf("Automatically create Tor onion service (default: %d)", DEFAULT_LISTEN_ONION), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u. It does not apply to short-lived private broadcast connections either, which have a separate limit of %u.", DEFAULT_MAX_PEER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS, MAX_PRIVATE_BROADCAST_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). %u slots of these are reserved for outgoing connections. See -inboundrelaypercent for more information about limits applied to transaction relay inbound peers. "
+                                                    "This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u. "
+                                                    "It does not apply to short-lived private broadcast connections either, which have a separate limit of %u.",
+                                                    DEFAULT_MAX_PEER_CONNECTIONS, MAX_OUTBOUND_FULL_RELAY_CONNECTIONS + MAX_BLOCK_RELAY_ONLY_CONNECTIONS + MAX_FEELER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS, MAX_PRIVATE_BROADCAST_CONNECTIONS),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-inboundrelaypercent=<n>", strprintf("Permit a maximum percent of inbound connections to relay transactions, to limit memory utilization (0 to 100, default: %u).", DEFAULT_FULL_RELAY_INBOUND_PCT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxreceivebuffer=<n>", strprintf("Maximum per-connection receive buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXRECEIVEBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxsendbuffer=<n>", strprintf("Maximum per-connection memory usage for the send buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXSENDBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxuploadtarget=<n>", strprintf("Tries to keep outbound traffic under the given target per 24h. Limit does not apply to peers with 'download' permission or blocks created within past week. 0 = no limit (default: %s). Optional suffix units [k|K|m|M|g|G|t|T] (default: M). Lowercase is 1000 base while uppercase is 1024 base", DEFAULT_MAX_UPLOAD_TARGET), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -707,6 +717,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                    OptionsCategory::NODE_RELAY);
     argsman.AddArg("-minrelaytxfee=<amt>", strprintf("Fees (in %s/kvB) smaller than this are considered zero fee for relaying, mining and transaction creation (default: %s)",
         CURRENCY_UNIT, FormatMoney(DEFAULT_MIN_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-txsendrate=<n>",
+                   strprintf("Set the maximum ongoing rate for sending transactions to (inbound) peers (default: %u tx/s)",
+                             DEFAULT_TX_SEND_RATE),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-privatebroadcast",
                    strprintf(
                        "Broadcast transactions submitted via sendrawtransaction RPC using short-lived "
@@ -771,7 +785,7 @@ static void StartupNotify(const ArgsManager& args)
 static bool AppInitServers(NodeContext& node)
 {
     const ArgsManager& args = *Assert(node.args);
-    if (!InitHTTPServer(*Assert(node.shutdown_signal))) {
+    if (!InitHTTPServer()) {
         return false;
     }
     StartRPC();
@@ -1574,7 +1588,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
      * be disabled when initialisation is finished.
      */
     if (args.GetBoolArg("-server", false)) {
-        uiInterface.InitMessage_connect(SetRPCWarmupStatus);
+        uiInterface.InitMessage.connect(SetRPCWarmupStatus);
         if (!AppInitServers(node))
             return InitError(_("Unable to start HTTP server. See debug log for details."));
     }
@@ -1821,7 +1835,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     for (const std::string& strAddr : args.GetArgs("-externalip")) {
         const std::optional<CService> addrLocal{Lookup(strAddr, GetListenPort(), fNameLookup)};
         if (addrLocal.has_value() && addrLocal->IsValid())
-            AddLocal(addrLocal.value(), LOCAL_MANUAL);
+            AddLocal(addrLocal.value(), LOCAL_MANUAL, /*add_even_if_unreachable=*/true);
         else
             return InitError(ResolveErrMsg("externalip", strAddr));
     }
@@ -2026,7 +2040,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 #if HAVE_SYSTEM
     const std::string block_notify = args.GetArg("-blocknotify", "");
     if (!block_notify.empty()) {
-        uiInterface.NotifyBlockTip_connect([block_notify](SynchronizationState sync_state, const CBlockIndex& block, double /* verification_progress */) {
+        uiInterface.NotifyBlockTip.connect([block_notify](SynchronizationState sync_state, const CBlockIndex& block, double /* verification_progress */) {
             if (sync_state != SynchronizationState::POST_INIT) return;
             std::string command = block_notify;
             ReplaceAll(command, "%s", block.GetBlockHash().GetHex());
@@ -2042,10 +2056,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     /// \anchor initload
-    node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
+    node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &kernel_notifications, &node] {
         ScheduleBatchPriority();
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
+        // An interrupted import may return without activating genesis. Wake
+        // the init thread's genesis wait, which is otherwise only notified
+        // on blockTip, and that never fires when the import was interrupted
+        // before activating genesis. This wakeup lets the wait observe the
+        // shutdown request.
+        WITH_LOCK(kernel_notifications.m_tip_block_mutex, kernel_notifications.m_tip_block_cv.notify_all());
         WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogInfo("Stopping after block import");
@@ -2118,12 +2138,21 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     CConnman::Options connOptions;
     connOptions.m_local_services = g_local_services;
     connOptions.m_max_automatic_connections = nMaxConnections;
+    connOptions.m_full_relay_inbound_percent = std::clamp<int>(args.GetIntArg("-inboundrelaypercent", DEFAULT_FULL_RELAY_INBOUND_PCT), 0, 100);
     connOptions.uiInterface = &uiInterface;
     connOptions.m_banman = node.banman.get();
     connOptions.m_msgproc = node.peerman.get();
     connOptions.nSendBufferMaxSize = 1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
     connOptions.nReceiveFloodSize = 1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
-    connOptions.m_added_nodes = args.GetArgs("-addnode");
+    for (const std::string& added_node : args.GetArgs("-addnode")) {
+        // Such a value is not a valid connection target, but would otherwise be
+        // treated as one and retried indefinitely.
+        if (TrimStringView(added_node).empty()) {
+            LogWarning("Ignoring empty -addnode value");
+            continue;
+        }
+        connOptions.m_added_nodes.push_back(added_node);
+    }
     connOptions.nMaxOutboundLimit = *opt_max_upload;
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);

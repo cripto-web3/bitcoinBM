@@ -7,6 +7,7 @@
 Roughly based on https://web.archive.org/web/20190424172231/http://voorloopnul.com/blog/a-python-netstat-in-less-than-100-lines-of-code/ by Ricardo Pascal
 """
 
+import http.client
 import sys
 import socket
 import struct
@@ -33,6 +34,15 @@ STATE_LISTEN = '0A'
 ADDRMAN_NEW_BUCKET_COUNT = 1 << 10
 ADDRMAN_TRIED_BUCKET_COUNT = 1 << 8
 ADDRMAN_BUCKET_SIZE = 1 << 6
+
+# When a test expects a server disconnection, any of these errors are
+# acceptable. The specific event is determined by race condition and platform OS.
+NETWORK_ERRORS = (
+    BrokenPipeError,                 # write to a closed socket/pipe
+    ConnectionResetError,            # connection forcibly closed by peer
+    ConnectionAbortedError,          # connection aborted locally or by network stack
+    http.client.ResponseNotReady,    # server response not ready or connection out of sync
+)
 
 def get_socket_inodes(pid):
     '''
@@ -211,6 +221,37 @@ def format_addr_port(addr, port):
         return f"[{addr}]:{port}"
     else:
         return f"{addr}:{port}"
+
+def format_sock(sock, *, local):
+    '''
+    Format either local or remote side of a socket to a human readable string, e.g.
+    1.2.3.4:8333 or
+    [11:22::33]:8333 or
+    /path/to/socket or
+    @abstract-socket
+    '''
+    try:
+        if local:
+            name = sock.getsockname()
+        else:
+            name = sock.getpeername()
+    except Exception:
+        return "n/a"
+
+    if sock.family == socket.AF_INET:
+        return f"{name[0]}:{name[1]}"
+
+    if sock.family == socket.AF_INET6:
+        return f"[{name[0]}]:{name[1]}"
+
+    if sock.family == socket.AF_UNIX:
+        if isinstance(name, bytes):
+            name = name.decode(errors="backslashreplace")
+        if name.startswith("\0"):
+            return f"@{name[1:]}"
+        return name
+
+    return str(name)
 
 
 def set_ephemeral_port_range(sock):

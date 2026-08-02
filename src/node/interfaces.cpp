@@ -6,7 +6,6 @@
 
 #include <banman.h>
 #include <blockfilter.h>
-#include <btcsignals.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
@@ -60,6 +59,7 @@
 #include <txmempool.h>
 #include <uint256.h>
 #include <univalue.h>
+#include <util/btcsignals.h>
 #include <util/check.h>
 #include <util/result.h>
 #include <util/signalinterrupt.h>
@@ -386,50 +386,50 @@ public:
     }
     std::unique_ptr<Handler> handleInitMessage(InitMessageFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.InitMessage_connect(fn));
+        return MakeSignalHandler(::uiInterface.InitMessage.connect(fn));
     }
     std::unique_ptr<Handler> handleMessageBox(MessageBoxFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.ThreadSafeMessageBox_connect(fn));
+        return MakeSignalHandler(::uiInterface.ThreadSafeMessageBox.connect(fn));
     }
     std::unique_ptr<Handler> handleQuestion(QuestionFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.ThreadSafeQuestion_connect(fn));
+        return MakeSignalHandler(::uiInterface.ThreadSafeQuestion.connect(fn));
     }
     std::unique_ptr<Handler> handleShowProgress(ShowProgressFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.ShowProgress_connect(fn));
+        return MakeSignalHandler(::uiInterface.ShowProgress.connect(fn));
     }
     std::unique_ptr<Handler> handleInitWallet(InitWalletFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.InitWallet_connect(fn));
+        return MakeSignalHandler(::uiInterface.InitWallet.connect(fn));
     }
     std::unique_ptr<Handler> handleNotifyNumConnectionsChanged(NotifyNumConnectionsChangedFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.NotifyNumConnectionsChanged_connect(fn));
+        return MakeSignalHandler(::uiInterface.NotifyNumConnectionsChanged.connect(fn));
     }
     std::unique_ptr<Handler> handleNotifyNetworkActiveChanged(NotifyNetworkActiveChangedFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.NotifyNetworkActiveChanged_connect(fn));
+        return MakeSignalHandler(::uiInterface.NotifyNetworkActiveChanged.connect(fn));
     }
     std::unique_ptr<Handler> handleNotifyAlertChanged(NotifyAlertChangedFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.NotifyAlertChanged_connect(fn));
+        return MakeSignalHandler(::uiInterface.NotifyAlertChanged.connect(fn));
     }
     std::unique_ptr<Handler> handleBannedListChanged(BannedListChangedFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.BannedListChanged_connect(fn));
+        return MakeSignalHandler(::uiInterface.BannedListChanged.connect(fn));
     }
     std::unique_ptr<Handler> handleNotifyBlockTip(NotifyBlockTipFn fn) override
     {
-        return MakeSignalHandler(::uiInterface.NotifyBlockTip_connect([fn](SynchronizationState sync_state, const CBlockIndex& block, double verification_progress) {
+        return MakeSignalHandler(::uiInterface.NotifyBlockTip.connect([fn](SynchronizationState sync_state, const CBlockIndex& block, double verification_progress) {
             fn(sync_state, BlockTip{block.nHeight, block.GetBlockTime(), block.GetBlockHash()}, verification_progress);
         }));
     }
     std::unique_ptr<Handler> handleNotifyHeaderTip(NotifyHeaderTipFn fn) override
     {
         return MakeSignalHandler(
-            ::uiInterface.NotifyHeaderTip_connect([fn](SynchronizationState sync_state, int64_t height, int64_t timestamp, bool presync) {
+            ::uiInterface.NotifyHeaderTip.connect([fn](SynchronizationState sync_state, int64_t height, int64_t timestamp, bool presync) {
                 fn(sync_state, BlockTip{(int)height, timestamp, uint256{}}, presync);
             }));
     }
@@ -917,12 +917,11 @@ public:
         return TransactionMerklePath(m_block_template->block, 0);
     }
 
-    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase) override
+    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase, std::string& reason, std::string& debug) override
     {
+        if (!coinbase) return false;
         AddMerkleRootAndCoinbase(m_block_template->block, std::move(coinbase), version, timestamp, nonce);
-        std::string reason;
-        std::string debug;
-        return SubmitBlock(chainman(), std::make_shared<const CBlock>(m_block_template->block), /*new_block=*/nullptr, reason, debug);
+        return SubmitBlock(chainman(), std::make_shared<const CBlock>(m_block_template->block), reason, debug);
     }
 
     std::unique_ptr<BlockTemplate> waitNext(BlockWaitOptions options) override
@@ -1025,13 +1024,33 @@ public:
 
     bool submitBlock(const CBlock& block_in, std::string& reason, std::string& debug) override
     {
-        auto block = std::make_shared<const CBlock>(block_in);
-        bool new_block;
-        const bool accepted = SubmitBlock(chainman(), block, &new_block, reason, debug);
-        // ProcessNewBlock() can accept and store a block before it is checked
-        // for validity. Treat duplicates as errors for mining clients, and only
-        // return success when validation completed without setting a reason.
-        return accepted && new_block && reason.empty();
+        return SubmitBlock(chainman(), std::make_shared<const CBlock>(block_in), reason, debug);
+    }
+
+    std::vector<CTransactionRef> getTransactionsByTxID(const std::vector<Txid>& txids) override
+    {
+        if (!m_node.mempool) return {};
+
+        std::vector<CTransactionRef> results;
+        results.reserve(txids.size());
+        LOCK(m_node.mempool->cs);
+        for (const auto& txid : txids) {
+            results.emplace_back(m_node.mempool->get(txid));
+        }
+        return results;
+    }
+
+    std::vector<CTransactionRef> getTransactionsByWitnessID(const std::vector<Wtxid>& wtxids) override
+    {
+        if (!m_node.mempool) return {};
+
+        std::vector<CTransactionRef> results;
+        results.reserve(wtxids.size());
+        LOCK(m_node.mempool->cs);
+        for (const auto& wtxid : wtxids) {
+            results.emplace_back(m_node.mempool->get(wtxid));
+        }
+        return results;
     }
 
     const NodeContext* context() override { return &m_node; }

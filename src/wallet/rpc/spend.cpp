@@ -139,7 +139,7 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
-            pwallet->CommitTransaction(tx, {}, /*orderForm=*/{});
+            pwallet->CommitTransaction(tx);
         } else {
             result.pushKV("hex", hex);
         }
@@ -168,12 +168,16 @@ static void PreventOutdatedOptions(const UniValue& options)
     }
 }
 
-UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, mapValue_t map_value, bool verbose)
+UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, std::optional<std::string> comment, std::optional<std::string> comment_to, bool verbose)
 {
     EnsureWalletIsUnlocked(wallet);
 
     // This function is only used by sendtoaddress and sendmany.
-    // This should always try to sign, if we don't have private keys, don't try to do anything here.
+    // This should always try to sign, if we don't have (all) private keys, don't
+    // try to do anything here.
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: sendtoaddress and sendmany are not supported for wallets with external signers; use send instead");
+    }
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
     }
@@ -187,7 +191,7 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    wallet.CommitTransaction(tx, std::move(map_value), /*orderForm=*/{});
+    wallet.CommitTransaction(tx, /*replaces_txid=*/std::nullopt, comment, comment_to);
     if (verbose) {
         UniValue entry(UniValue::VOBJ);
         entry.pushKV("txid", tx->GetHash().GetHex());
@@ -297,11 +301,12 @@ RPCMethod sendtoaddress()
     LOCK(pwallet->cs_wallet);
 
     // Wallet comments
-    mapValue_t mapValue;
+    std::optional<std::string> comment;
+    std::optional<std::string> comment_to;
     if (!request.params[2].isNull() && !request.params[2].get_str().empty())
-        mapValue["comment"] = request.params[2].get_str();
+        comment = request.params[2].get_str();
     if (!request.params[3].isNull() && !request.params[3].get_str().empty())
-        mapValue["to"] = request.params[3].get_str();
+        comment_to = request.params[3].get_str();
 
     CCoinControl coin_control;
     if (!request.params[5].isNull()) {
@@ -328,7 +333,7 @@ RPCMethod sendtoaddress()
     std::vector<CRecipient> recipients{CreateRecipients(ParseOutputs(address_amounts), sffo_set)};
     const bool verbose{request.params[10].isNull() ? false : request.params[10].get_bool()};
 
-    return SendMoney(*pwallet, coin_control, recipients, mapValue, verbose);
+    return SendMoney(*pwallet, coin_control, recipients, comment, comment_to, verbose);
 },
     };
 }
@@ -342,13 +347,15 @@ RPCMethod sendmany()
                     {"dummy", RPCArg::Type::STR, RPCArg::Default{"\"\""}, "Must be set to \"\" for backwards compatibility.",
                      RPCArgOptions{
                          .oneline_description = "\"\"",
+                         .placeholder = true,
                      }},
                     {"amounts", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::NO, "The addresses and amounts",
                         {
                             {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The bitcoin address is the key, the numeric amount (can be string) in " + CURRENCY_UNIT + " is the value"},
                         },
                     },
-                    {"minconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ignored dummy value"},
+                    {"minconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ignored dummy value",
+                        RPCArgOptions{.placeholder = true}},
                     {"comment", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "A comment"},
                     {"subtractfeefrom", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "The addresses.\n"
                                        "The fee will be equally deducted from the amount of each selected address.\n"
@@ -405,9 +412,9 @@ RPCMethod sendmany()
     }
     UniValue sendTo = request.params[1].get_obj();
 
-    mapValue_t mapValue;
+    std::optional<std::string> comment;
     if (!request.params[3].isNull() && !request.params[3].get_str().empty())
-        mapValue["comment"] = request.params[3].get_str();
+        comment = request.params[3].get_str();
 
     CCoinControl coin_control;
     if (!request.params[5].isNull()) {
@@ -422,7 +429,7 @@ RPCMethod sendmany()
     );
     const bool verbose{request.params[9].isNull() ? false : request.params[9].get_bool()};
 
-    return SendMoney(*pwallet, coin_control, recipients, std::move(mapValue), verbose);
+    return SendMoney(*pwallet, coin_control, recipients, comment, /*comment_to=*/std::nullopt, verbose);
 },
     };
 }
@@ -1179,8 +1186,7 @@ RPCMethod send()
 {
     return RPCMethod{
         "send",
-        "EXPERIMENTAL warning: this call may be changed in future releases.\n"
-        "\nSend a transaction.\n",
+        "Send a transaction.\n",
         {
             {"outputs", RPCArg::Type::ARR, RPCArg::Optional::NO, "The outputs specified as key-value pairs.\n"
                     "Each key may only appear once, i.e. there can only be one 'data' output, and no address may be duplicated.\n"
@@ -1302,8 +1308,7 @@ RPCMethod send()
 RPCMethod sendall()
 {
     return RPCMethod{"sendall",
-        "EXPERIMENTAL warning: this call may be changed in future releases.\n"
-        "\nSpend the value of all (or specific) confirmed UTXOs and unconfirmed change in the wallet to one or more recipients.\n"
+        "Spend the value of all (or specific) confirmed UTXOs and unconfirmed change in the wallet to one or more recipients.\n"
         "Unconfirmed inbound UTXOs and locked UTXOs will not be spent. Sendall will respect the avoid_reuse wallet flag.\n"
         "If your wallet contains many small inputs, either because it received tiny payments or as a result of accumulating change, consider using `send_max` to exclude inputs that are worth less than the fees needed to spend them.\n",
         {

@@ -14,7 +14,6 @@ from test_framework.p2p import (
     P2PDataStore,
     P2PInterface,
     P2P_SERVICES,
-    P2P_VERSION,
     start_p2p_listener,
 )
 from test_framework.messages import (
@@ -46,7 +45,14 @@ from test_framework.wallet import (
     MiniWallet,
 )
 
+P2P_PRIVATE_VERSION = 70016
 NUM_PRIVATE_BROADCAST_PER_TX = 3
+
+
+class NoRelayP2PInterface(P2PInterface):
+    def peer_connect_send_version(self, services):
+        super().peer_connect_send_version(services)
+        self.on_connection_send_msg.relay = 0
 
 
 class P2PPrivateBroadcast(BitcoinTestFramework):
@@ -58,6 +64,9 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
         self.destinations = []
 
         self.destinations_lock = threading.Lock()
+
+        self.trigger_no_relay_peer = False
+        self.no_relay_peer = None
 
         def find_connection_type_in_debug_log(to_addr, to_port):
             """
@@ -106,6 +115,11 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
                     if conn_type == "outbound-full-relay" and not any(dest["conn_type"] == "outbound-full-relay" for dest in self.destinations):
                         listener = P2PDataStore()
                         target_name = "Python P2PDataStore"
+                    elif conn_type == "private-broadcast" and self.trigger_no_relay_peer:
+                        listener = NoRelayP2PInterface()
+                        target_name = "Python NoRelayP2PInterface"
+                        self.trigger_no_relay_peer = False
+                        self.no_relay_peer = listener
                     else:
                         listener = P2PInterface()
                         target_name = "Python P2PInterface"
@@ -195,7 +209,7 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
             })
             dummy_address = CAddress()
             dummy_address.nServices = 0
-            assert_equal(peer.last_message["version"].nVersion, P2P_VERSION)
+            assert_equal(peer.last_message["version"].nVersion, P2P_PRIVATE_VERSION)
             assert_equal(peer.last_message["version"].nServices, 0)
             assert_equal(peer.last_message["version"].nTime, 0)
             assert_equal(peer.last_message["version"].addrTo, dummy_address)
@@ -222,6 +236,12 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
         self.tx_originator_debug_log_path = tx_originator.debug_log_path
         tx_receiver = self.nodes[1]
         far_observer = tx_receiver.add_p2p_connection(P2PInterface())
+
+        self.log.info("Test getprivatebroadcastinfo and abortprivatebroadcast fails if the node is running without -privatebroadcast set")
+        assert_raises_rpc_error(-32601, "Private broadcast is not enabled. Ensure you're running Bitcoin Core with -privatebroadcast=1.",
+            tx_receiver.getprivatebroadcastinfo)
+        assert_raises_rpc_error(-32601, "Private broadcast is not enabled. Ensure you're running Bitcoin Core with -privatebroadcast=1.",
+            tx_receiver.abortprivatebroadcast, "00" * 32)
 
         self.fill_node_addrman(node_index=0, address_types_to_add=[CAddress.NET_IPV4, CAddress.NET_IPV6, CAddress.NET_TORV3, CAddress.NET_I2P, CAddress.NET_CJDNS])
 
@@ -372,6 +392,19 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
             tx_originator.abortprivatebroadcast,
             "0" * 64,
         )
+
+        self.log.info("Checking that a private broadcast destination signaling relay=false gets disconnected")
+        tx_no_relay = wallet.create_self_transfer()
+        disconnect_msg = "Disconnecting: does not support transaction relay (connected in vain)"
+        with tx_originator.assert_debug_log(expected_msgs=[disconnect_msg]):
+            with self.destinations_lock:
+                self.no_relay_peer = None
+                self.trigger_no_relay_peer = True
+            tx_originator.sendrawtransaction(hexstring=tx_no_relay["hex"], maxfeerate=0.1)
+            self.wait_until(lambda: self.no_relay_peer is not None)
+            self.no_relay_peer.wait_until(lambda: self.no_relay_peer.message_count["version"] == 1, check_connected=False)
+            self.no_relay_peer.wait_for_disconnect()
+        assert_equal(self.no_relay_peer.message_count, {"version": 1})
 
         # Stop the SOCKS5 proxy server to avoid it being upset by the bitcoin
         # node disconnecting in the middle of the SOCKS5 handshake when we
