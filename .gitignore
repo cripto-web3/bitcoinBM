@@ -27,3 +27,20 @@ target/
 /guix-build-*
 
 /ci/scratch/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Bitcoin data and wallet files
+bitcoin_data/
+*.dat
+wallet.dat
+*/wallet.dat
+
+# Build artifacts and logs
+build/
+*.log
+logs/
