@@ -1,0 +1,301 @@
+name: Send UTXO on regtest + Deploy SCRIPT_PUBKEY_HEX
+
+on:
+  workflow_dispatch:
+    inputs:
+      to_address:
+        description: "Recipient BTC address"
+        required: true
+        type: string
+      amount_btc:
+        description: "Amount BTC to send (e.g. 0.0001)"
+        required: true
+        type: string
+      fee_rate_sat_vb:
+        description: "Fee rate in sat/vB (e.g. 20)"
+        required: true
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  blockchain-check:
+    name: Blockchain check (cookie auth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install bitcoind and jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bitcoind jq
+
+      - name: Start regtest node (cookie auth)
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-check
+        run: |
+          set -euo pipefail
+          mkdir -p "$BITCOIN_DATA_DIR"
+
+          bitcoind \
+            -regtest \
+            -server=1 \
+            -daemonwait \
+            -datadir="$BITCOIN_DATA_DIR" \
+            -fallbackfee=0.0002
+
+      - name: Query blockchain info
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-check
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" getblockchaininfo | jq .
+
+      - name: Generate blocks for test
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-check
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" createwallet "check-wallet" >/dev/null
+          MINER_ADDRESS=$(bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" -rpcwallet=check-wallet getnewaddress)
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" generatetoaddress 2 "$MINER_ADDRESS" >/dev/null
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" getblockcount
+
+      - name: Intentional error test (expected failure)
+        id: intentional_error
+        continue-on-error: true
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-check
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" getblockchaininfo_typo
+
+      - name: Verify intentional error was triggered
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.intentional_error.outcome }}" != "failure" ]]; then
+            echo "Intentional error step did not fail as expected"
+            exit 1
+          fi
+          echo "Intentional error behaved as expected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop regtest node safely
+        if: always()
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-check
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" stop || true
+          for _ in {1..20}; do
+            if [[ ! -f "$BITCOIN_DATA_DIR/regtest/bitcoind.pid" ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+  send-utxo-raw:
+    name: Send UTXO via raw tx (regtest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      txid: ${{ steps.broadcast.outputs.txid }}
+    steps:
+      - name: Install bitcoind and jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bitcoind jq
+
+      - name: Validate workflow inputs
+        shell: bash
+        env:
+          TO_ADDRESS: ${{ inputs.to_address }}
+          AMOUNT_BTC: ${{ inputs.amount_btc }}
+          FEE_RATE_SAT_VB: ${{ inputs.fee_rate_sat_vb }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$TO_ADDRESS" ]] || { echo "to_address is required"; exit 1; }
+
+          [[ "$AMOUNT_BTC" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid amount_btc"; exit 1; }
+          awk "BEGIN {exit !($AMOUNT_BTC > 0)}" || { echo "amount_btc must be > 0"; exit 1; }
+
+          [[ "$FEE_RATE_SAT_VB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid fee_rate_sat_vb"; exit 1; }
+          awk "BEGIN {exit !($FEE_RATE_SAT_VB > 0)}" || { echo "fee_rate_sat_vb must be > 0"; exit 1; }
+
+      - name: Start regtest node (cookie auth)
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-send
+        run: |
+          set -euo pipefail
+          mkdir -p "$BITCOIN_DATA_DIR"
+
+          bitcoind \
+            -regtest \
+            -server=1 \
+            -daemonwait \
+            -datadir="$BITCOIN_DATA_DIR" \
+            -fallbackfee=0.0002
+
+      - name: Build, fund, sign and broadcast raw transaction
+        id: broadcast
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-send
+          TO_ADDRESS: ${{ inputs.to_address }}
+          AMOUNT_BTC: ${{ inputs.amount_btc }}
+          FEE_RATE_SAT_VB: ${{ inputs.fee_rate_sat_vb }}
+        run: |
+          set -euo pipefail
+
+          cli() {
+            bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" "$@"
+          }
+
+          cli createwallet "workflow-wallet" >/dev/null
+          MINER_ADDRESS=$(cli -rpcwallet=workflow-wallet getnewaddress)
+          cli generatetoaddress 101 "$MINER_ADDRESS" >/dev/null
+
+          VALID_ADDRESS=$(cli validateaddress "$TO_ADDRESS" | jq -r '.isvalid')
+          [[ "$VALID_ADDRESS" == "true" ]] || { echo "Invalid recipient address"; exit 1; }
+
+          RAW_HEX=$(cli -named createrawtransaction \
+            inputs='[]' \
+            outputs="{\"$TO_ADDRESS\":$AMOUNT_BTC}")
+
+          FEE_RATE_BTC_KVB=$(awk "BEGIN { printf \"%f\", $FEE_RATE_SAT_VB * 0.00001 }")
+
+          FUNDED_JSON=$(cli -rpcwallet=workflow-wallet -named fundrawtransaction \
+            hexstring="$RAW_HEX" \
+            options="{\"fee_rate\":$FEE_RATE_BTC_KVB,\"replaceable\":true}")
+
+          FUNDED_HEX=$(echo "$FUNDED_JSON" | jq -r '.hex')
+          [[ -n "$FUNDED_HEX" && "$FUNDED_HEX" != "null" ]] || { echo "fundrawtransaction failed"; exit 1; }
+
+          SIGNED_JSON=$(cli -rpcwallet=workflow-wallet -named signrawtransactionwithwallet hexstring="$FUNDED_HEX")
+          COMPLETE=$(echo "$SIGNED_JSON" | jq -r '.complete')
+          [[ "$COMPLETE" == "true" ]] || { echo "Signing not complete"; exit 1; }
+
+          SIGNED_HEX=$(echo "$SIGNED_JSON" | jq -r '.hex')
+          TXID=$(cli sendrawtransaction "$SIGNED_HEX")
+
+          echo "::add-mask::$TXID"
+          echo "txid=$TXID" >> "$GITHUB_OUTPUT"
+
+      - name: Mine next block for confirmation
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-send
+        run: |
+          set -euo pipefail
+          cli() {
+            bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" "$@"
+          }
+          MINER_ADDRESS=$(cli -rpcwallet=workflow-wallet getnewaddress)
+          cli generatetoaddress 1 "$MINER_ADDRESS" >/dev/null
+
+      - name: Stop regtest node safely
+        if: always()
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-send
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" stop || true
+          for _ in {1..20}; do
+            if [[ ! -f "$BITCOIN_DATA_DIR/regtest/bitcoind.pid" ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+  deploy-script-pubkey-hex:
+    name: Deploy SCRIPT_PUBKEY_HEX
+    runs-on: ubuntu-latest
+    needs: [send-utxo-raw]
+    timeout-minutes: 15
+    steps:
+      - name: Install bitcoind and jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bitcoind jq
+
+      - name: Start regtest node (cookie auth)
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-scriptpub
+        run: |
+          set -euo pipefail
+          mkdir -p "$BITCOIN_DATA_DIR"
+          bitcoind \
+            -regtest \
+            -server=1 \
+            -daemonwait \
+            -datadir="$BITCOIN_DATA_DIR" \
+            -fallbackfee=0.0002
+
+      - name: Derive scriptPubKey from recipient address
+        id: derive_script
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-scriptpub
+          TO_ADDRESS: ${{ inputs.to_address }}
+          TXID: ${{ needs.send-utxo-raw.outputs.txid }}
+        run: |
+          set -euo pipefail
+
+          ADDR_JSON=$(bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" validateaddress "$TO_ADDRESS")
+          SCRIPT_PUBKEY_HEX=$(echo "$ADDR_JSON" | jq -r '.scriptPubKey')
+
+          [[ -n "$SCRIPT_PUBKEY_HEX" && "$SCRIPT_PUBKEY_HEX" != "null" ]] || {
+            echo "scriptPubKey is null"
+            exit 1
+          }
+
+          echo "::add-mask::$SCRIPT_PUBKEY_HEX"
+          echo "::add-mask::$TXID"
+
+          printf '%s\n' "$SCRIPT_PUBKEY_HEX" > script_pubkey_hex.txt
+
+          {
+            echo "### Deploy SCRIPT_PUBKEY_HEX"
+            echo "- txid: (masked)"
+            echo "- scriptPubKey: generated and masked"
+            echo "- artifact: script-pubkey-hex"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SCRIPT_PUBKEY_HEX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-pubkey-hex
+          path: script_pubkey_hex.txt
+          if-no-files-found: error
+
+      - name: Stop regtest node safely
+        if: always()
+        shell: bash
+        env:
+          BITCOIN_DATA_DIR: ${{ runner.temp }}/bitcoin-regtest-scriptpub
+        run: |
+          set -euo pipefail
+          bitcoin-cli -regtest -datadir="$BITCOIN_DATA_DIR" stop || true
+          for _ in {1..20}; do
+            if [[ ! -f "$BITCOIN_DATA_DIR/regtest/bitcoind.pid" ]]; then
+              break
+            fi
+            sleep 1
+          done
