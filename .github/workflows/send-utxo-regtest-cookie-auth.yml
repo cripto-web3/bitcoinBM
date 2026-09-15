@@ -1,0 +1,297 @@
+name: Send UTXO regtest cookie auth
+
+on:
+  workflow_dispatch:
+    inputs:
+      to_address:
+        description: "Recipient regtest address"
+        required: true
+        type: string
+      amount_btc:
+        description: "Amount BTC (e.g. 0.0001)"
+        required: true
+        type: string
+      fee_rate_sat_vb:
+        description: "Fee rate sat/vB (e.g. 20)"
+        required: true
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  send-utxo-raw:
+    name: send-utxo-raw
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      txid: ${{ steps.send.outputs.txid }}
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          BITCOIN_VERSION="27.1"
+          BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}"
+          ARCH="$(uname -m)"
+          TARBALL="bitcoin-${BITCOIN_VERSION}-${ARCH}-linux-gnu.tar.gz"
+
+          curl -fsSLO "${BASE_URL}/${TARBALL}"
+          curl -fsSLO "${BASE_URL}/SHA256SUMS"
+          grep " ${TARBALL}$" SHA256SUMS | sha256sum -c -
+
+          tar -xzf "$TARBALL"
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoind" /usr/local/bin/bitcoind
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli" /usr/local/bin/bitcoin-cli
+
+      - name: Build fund sign and broadcast raw tx on regtest
+        id: send
+        env:
+          TO_ADDRESS: ${{ inputs.to_address }}
+          AMOUNT_BTC: ${{ inputs.amount_btc }}
+          FEE_RATE_SAT_VB: ${{ inputs.fee_rate_sat_vb }}
+        run: |
+          set -euo pipefail
+
+          [[ "$AMOUNT_BTC" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid amount_btc"; exit 1; }
+          [[ "$FEE_RATE_SAT_VB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid fee_rate_sat_vb"; exit 1; }
+          awk "BEGIN {exit !($AMOUNT_BTC > 0)}" || { echo "amount_btc must be > 0"; exit 1; }
+          awk "BEGIN {exit !($FEE_RATE_SAT_VB > 0)}" || { echo "fee_rate_sat_vb must be > 0"; exit 1; }
+
+          DATADIR="$RUNNER_TEMP/bitcoin-send"
+          mkdir -p "$DATADIR"
+          printf '%s\n' \
+            'regtest=1' \
+            'server=1' \
+            'daemon=1' \
+            'txindex=1' \
+            'fallbackfee=0.0002' \
+            'rpcbind=127.0.0.1' \
+            'rpcallowip=127.0.0.1' > "$DATADIR/bitcoin.conf"
+
+          bitcoind -datadir="$DATADIR"
+
+          COOKIE_FILE="$DATADIR/regtest/.cookie"
+          for _ in $(seq 1 30); do
+            [[ -f "$COOKIE_FILE" ]] && break
+            sleep 1
+          done
+          [[ -f "$COOKIE_FILE" ]] || { echo "Cookie auth file not found"; exit 1; }
+
+          cli() {
+            bitcoin-cli -regtest -datadir="$DATADIR" -rpccookiefile="$COOKIE_FILE" "$@"
+          }
+
+          trap 'cli stop >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            cli getblockchaininfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          WALLET="workflowwallet"
+          cli -named createwallet wallet_name="$WALLET" descriptors=true load_on_startup=false >/dev/null
+
+          MINER_ADDR=$(cli -rpcwallet="$WALLET" getnewaddress)
+          cli -rpcwallet="$WALLET" generatetoaddress 101 "$MINER_ADDR" >/dev/null
+
+          VALIDATION=$(cli validateaddress "$TO_ADDRESS")
+          echo "$VALIDATION" | jq -e '.isvalid == true' >/dev/null || {
+            echo "Invalid regtest address"; exit 1;
+          }
+
+          OUTPUTS_JSON=$(jq -cn --arg addr "$TO_ADDRESS" --arg amount "$AMOUNT_BTC" '{($addr): ($amount | tonumber)}')
+          RAW_HEX=$(cli -named createrawtransaction inputs='[]' outputs="$OUTPUTS_JSON")
+
+          FEE_RATE_BTC_KVB=$(python3 -c "print(float('$FEE_RATE_SAT_VB') * 0.00001)")
+          OPTIONS_JSON=$(jq -cn --arg fee_rate "$FEE_RATE_BTC_KVB" '{fee_rate: ($fee_rate | tonumber), replaceable: true}')
+
+          FUNDED_JSON=$(cli -named fundrawtransaction hexstring="$RAW_HEX" options="$OPTIONS_JSON")
+          FUNDED_HEX=$(echo "$FUNDED_JSON" | jq -r '.hex')
+
+          SIGNED_JSON=$(cli -named signrawtransactionwithwallet hexstring="$FUNDED_HEX")
+          echo "$SIGNED_JSON" | jq -e '.complete == true' >/dev/null || { echo "Signing not complete"; exit 1; }
+          SIGNED_HEX=$(echo "$SIGNED_JSON" | jq -r '.hex')
+
+          TXID=$(cli sendrawtransaction "$SIGNED_HEX")
+
+          echo "txid=$TXID" >> "$GITHUB_OUTPUT"
+          {
+            echo "### send-utxo-raw"
+            echo "- txid: $TXID"
+            echo "- fee_rate_sat_vb: $FEE_RATE_SAT_VB"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-script-pubkey-hex:
+    name: deploy-script-pubkey-hex
+    runs-on: ubuntu-latest
+    needs: [send-utxo-raw]
+    timeout-minutes: 15
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          BITCOIN_VERSION="27.1"
+          BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}"
+          ARCH="$(uname -m)"
+          TARBALL="bitcoin-${BITCOIN_VERSION}-${ARCH}-linux-gnu.tar.gz"
+
+          curl -fsSLO "${BASE_URL}/${TARBALL}"
+          curl -fsSLO "${BASE_URL}/SHA256SUMS"
+          grep " ${TARBALL}$" SHA256SUMS | sha256sum -c -
+
+          tar -xzf "$TARBALL"
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoind" /usr/local/bin/bitcoind
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli" /usr/local/bin/bitcoin-cli
+
+      - name: Derive scriptPubKey hex and write artifact
+        env:
+          TO_ADDRESS: ${{ inputs.to_address }}
+          TXID: ${{ needs.send-utxo-raw.outputs.txid }}
+        run: |
+          set -euo pipefail
+
+          DATADIR="$RUNNER_TEMP/bitcoin-scriptpubkey"
+          mkdir -p "$DATADIR"
+          printf '%s\n' \
+            'regtest=1' \
+            'server=1' \
+            'daemon=1' \
+            'rpcbind=127.0.0.1' \
+            'rpcallowip=127.0.0.1' > "$DATADIR/bitcoin.conf"
+
+          bitcoind -datadir="$DATADIR"
+
+          COOKIE_FILE="$DATADIR/regtest/.cookie"
+          for _ in $(seq 1 30); do
+            [[ -f "$COOKIE_FILE" ]] && break
+            sleep 1
+          done
+          [[ -f "$COOKIE_FILE" ]] || { echo "Cookie auth file not found"; exit 1; }
+
+          cli() {
+            bitcoin-cli -regtest -datadir="$DATADIR" -rpccookiefile="$COOKIE_FILE" "$@"
+          }
+
+          trap 'cli stop >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            cli getblockchaininfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          VALIDATION=$(cli validateaddress "$TO_ADDRESS")
+          echo "$VALIDATION" | jq -e '.isvalid == true' >/dev/null || {
+            echo "Invalid regtest address"; exit 1;
+          }
+          SCRIPT_PUBKEY_HEX=$(echo "$VALIDATION" | jq -r '.scriptPubKey')
+          [[ -n "$SCRIPT_PUBKEY_HEX" && "$SCRIPT_PUBKEY_HEX" != "null" ]] || {
+            echo "Missing scriptPubKey"; exit 1;
+          }
+
+          printf '%s\n' "$SCRIPT_PUBKEY_HEX" > script_pubkey_hex.txt
+
+          {
+            echo "### deploy-script-pubkey-hex"
+            echo "- txid: $TXID"
+            echo "- script_pubkey_hex: $SCRIPT_PUBKEY_HEX"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scriptPubKey hex artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: script_pubkey_hex
+          path: script_pubkey_hex.txt
+          if-no-files-found: error
+
+  error-test-blockchain:
+    name: error-test-blockchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          BITCOIN_VERSION="27.1"
+          BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}"
+          ARCH="$(uname -m)"
+          TARBALL="bitcoin-${BITCOIN_VERSION}-${ARCH}-linux-gnu.tar.gz"
+
+          curl -fsSLO "${BASE_URL}/${TARBALL}"
+          curl -fsSLO "${BASE_URL}/SHA256SUMS"
+          grep " ${TARBALL}$" SHA256SUMS | sha256sum -c -
+
+          tar -xzf "$TARBALL"
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoind" /usr/local/bin/bitcoind
+          sudo install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli" /usr/local/bin/bitcoin-cli
+
+      - name: Generate blocks run intentional error and validate state
+        run: |
+          set -euo pipefail
+
+          DATADIR="$RUNNER_TEMP/bitcoin-error-test"
+          mkdir -p "$DATADIR"
+          printf '%s\n' \
+            'regtest=1' \
+            'server=1' \
+            'daemon=1' \
+            'rpcbind=127.0.0.1' \
+            'rpcallowip=127.0.0.1' > "$DATADIR/bitcoin.conf"
+
+          bitcoind -datadir="$DATADIR"
+
+          COOKIE_FILE="$DATADIR/regtest/.cookie"
+          for _ in $(seq 1 30); do
+            [[ -f "$COOKIE_FILE" ]] && break
+            sleep 1
+          done
+          [[ -f "$COOKIE_FILE" ]] || { echo "Cookie auth file not found"; exit 1; }
+
+          cli() {
+            bitcoin-cli -regtest -datadir="$DATADIR" -rpccookiefile="$COOKIE_FILE" "$@"
+          }
+
+          trap 'cli stop >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            cli getblockchaininfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          WALLET="errortestwallet"
+          cli -named createwallet wallet_name="$WALLET" descriptors=true load_on_startup=false >/dev/null
+          MINER_ADDR=$(cli -rpcwallet="$WALLET" getnewaddress)
+          cli -rpcwallet="$WALLET" generatetoaddress 3 "$MINER_ADDR" >/dev/null
+
+          if cli getblockhash -1 >/dev/null 2>error.log; then
+            echo "Intentional error test did not fail as expected"
+            exit 1
+          fi
+          [[ -s error.log ]] || { echo "Expected error output not found"; exit 1; }
+
+          INFO_JSON=$(cli getblockchaininfo)
+          CHAIN=$(echo "$INFO_JSON" | jq -r '.chain')
+          BLOCKS=$(echo "$INFO_JSON" | jq -r '.blocks')
+
+          [[ "$CHAIN" == "regtest" ]] || { echo "Unexpected chain: $CHAIN"; exit 1; }
+          [[ "$BLOCKS" =~ ^[0-9]+$ ]] || { echo "Invalid blocks value"; exit 1; }
+          (( BLOCKS >= 3 )) || { echo "Expected at least 3 blocks, got $BLOCKS"; exit 1; }
+
+          {
+            echo "### error-test-blockchain"
+            echo "- intentional_error: passed"
+            echo "- chain: $CHAIN"
+            echo "- blocks: $BLOCKS"
+          } >> "$GITHUB_STEP_SUMMARY"
